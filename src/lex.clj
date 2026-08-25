@@ -44,6 +44,16 @@
 ;  text in (∗ . . . ∗). The latter form of comment may be nested. "
 ; provavelmente usar uma stack/PDA
 
+(defn advance-cursor
+  [s row col]
+  (if (not (empty? s))
+    (if (= (first s) \newline)
+      (recur (rest s) (+ row 1) 1)
+      (recur (rest s) row (+ col 1)))
+  [row col] 
+  )
+)
+
 
 (defn classify-word 
   [word]
@@ -52,8 +62,8 @@
     (= word "self")                                :self-token
     (= word "SELF_TYPE")                           :self-type-token
     (keyword-table low-word)                       :keyword
-    (and (= low-word "true")  (= (first word) \t)) :boolean
-    (and (= low-word "false") (= (first word) \f)) :boolean
+    (and (= (first word) \t) (= low-word "true"))  :boolean
+    (and (= (first word) \f) (= low-word "false")) :boolean
     (Character/isUpperCase (first word))           :type-identifier
     :else                                          :object-identifier
   ))
@@ -75,16 +85,6 @@
 ;   tok = lex(buf)
 ;   if (erro)...
 
-(def special-char-table 
-  {
-    \t \tab
-    \b \backspace
-    \n \newline
-    \f \formfeed
-    \newline \newline
-  }
-)
-
 (defn ignore-singleline-comment
   [buf]
   (let [c (first buf)]
@@ -95,9 +95,9 @@
 )
 
 (defn ignore-multiline-comment
-  ([buf]
-    (ignore-multiline-comment buf '()))
-  ([buf stack]
+  ([buf row col]
+    (ignore-multiline-comment buf row col '()))
+  ([buf row col stack]
     (let [[c1 c2 & tail] buf]
     (cond
       (nil? c1)
@@ -105,15 +105,24 @@
 
       (and (= c1 \*) (= c2 \)))
         (if (empty? (rest stack))
-          tail
-          (recur tail (rest stack)) 
+          [tail row (+ col 2)]
+          (recur tail row (+ col 2) (rest stack)) 
         )
 
       (and (= c1 \() (= c2 \*))
-        (recur tail (cons \( stack))
+        (recur tail row (+ col 2) (cons \( stack))
+
+      (and (= c1 \newline) (= c2 \newline))
+        (recur tail (+ row 2) 1 stack)
+
+      (and (= c1 \newline))
+        (recur (rest buf) (+ row 1) 1 stack)
+
+      (and (= c2 \newline))
+        (recur tail (+ row 1) 1 stack)
 
       :else
-        (recur (rest buf) stack)
+        (recur (rest buf) row (+ col 1) stack)
     )
   ))
 )
@@ -137,7 +146,7 @@
       (nil? (first buf))        (die "Falta fechar a string.")
       (= \u0000 (first buf))    (die "Caractere nulo '\\0' encontrado na string.")
       (= \newline (first buf))  (die "Faltou escapar o '\\n'")
-      (= (first buf) \\)        (let [[_ c & tail] buf] (recur tail (str string (get special-char-table c c))))
+      (= (first buf) \\)        (let [[c1 c2 & tail] buf] (recur tail (str string c1 c2)))
       (quote? (first buf))      [(rest buf) [(str string \") :string]]
       :else                     (recur (rest buf) (str string (first buf)))
     )
@@ -176,29 +185,45 @@
 ; pode ser interessante mudar a ordem dos testes, para 
 ; diminuir os testes e melhorar a performance
 (defn lex
-  [buf]
+  ([buf]
+    (lex buf 1 1))
+  ([buf row col]
   (let [[c & tail] buf]
     (cond
       (nil? c)
         nil
       (Character/isDigit c)
-        (get-integer buf)
+        (let [[buf token] (get-integer buf)
+             [new-row new-col] (advance-cursor (first token) row col)]
+          [token buf new-row new-col]
+        )
       (valid-first-char? c)
-        (get-token buf)
+        (let [[buf token] (get-token buf)
+              [new-row new-col] (advance-cursor (first token) row col)]
+          [token buf new-row new-col]
+        )
       (quote? c) 
-        (get-string buf)
+        (let [[buf token] (get-string buf)
+              [new-row new-col] (advance-cursor (first token) row col)]
+          [token buf new-row new-col]
+        )
       (singleline-comment? buf)
-        (recur (ignore-singleline-comment buf))
+        (recur (ignore-singleline-comment buf) (+ row 1) 1)
       (multiline-comment? buf)
-        (recur (ignore-multiline-comment buf))
+        (let [[buf new-row new-col] (ignore-multiline-comment buf row col)]
+        (recur buf new-row new-col))
       (whitespace? c)
-        (recur (rest buf))
+        (let [[new-row new-col] (advance-cursor (str c) row col)]
+        (recur (rest buf) new-row new-col))
       ; operator precisa ser depois de testar se é comentário, pois
       ; comentários multilinha começam com '('
       (operator? c)
-        (get-operator buf)
+        (let [[buf token] (get-operator buf)
+              [new-row new-col] (advance-cursor (first token) row col)]
+          [token buf new-row new-col]
+        )
       :else
-        [tail [c :error (str "Caractere inválido: " c)]]
+        [[c :error (str "Caractere inválido: " c)] tail row (+ col 1)]
     )
-  )
+  ))
 )
