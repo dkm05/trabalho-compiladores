@@ -9,10 +9,5 @@
       (println "usage: java -jar ./parser <file.cl>")
       (loop [[token buf row col] (lex/lex (seq (slurp filename)))]
         (when token
-          (prn token row col) 
-          (recur (lex/lex buf row col))
-        )
-      )
-    )
-  )
-)
+          (prn token row col)
+          (recur (lex/lex buf row col)))))))
