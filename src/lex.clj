@@ -103,23 +103,16 @@
       (nil? c1)
         (die "erro: comentário multilinha não foi fechado")
 
-      (and (= c1 \*) (= c2 \)))
-        (if (empty? (rest stack))
-          [tail row (+ col 2)]
-          (recur tail row (+ col 2) (rest stack)) 
-        )
-
-      (and (= c1 \() (= c2 \*))
+      (= (str c1 c2) "(*")
         (recur tail row (+ col 2) (cons \( stack))
 
-      (and (= c1 \newline) (= c2 \newline))
-        (recur tail (+ row 2) 1 stack)
+      (= (str c1 c2) "*)")
+        (if (empty? (rest stack))
+          [tail row (+ col 2)]
+          (recur tail row (+ col 2) (rest stack)))
 
-      (and (= c1 \newline))
+      (= c1 \newline)
         (recur (rest buf) (+ row 1) 1 stack)
-
-      (and (= c2 \newline))
-        (recur tail (+ row 1) 1 stack)
 
       :else
         (recur (rest buf) row (+ col 1) stack)
