@@ -63,13 +63,14 @@
   [message]
   (println message))
 
-(defn advance-cursor
-  [s row col]
-  (if (not (empty? s))
-    (if (= (first s) \newline)
-      (recur (rest s) (+ row 1) 1)
-      (recur (rest s) row (+ col 1)))
-    [row col]))
+(defn next-char
+  [state] 
+  (let [[buf row col] (vals state)]
+    (if (= (first buf) \newline)
+      [(first buf) {:buf (rest buf) :row (+ row 1) :col 1}]
+      [(first buf) {:buf (rest buf) :row row :col (+ col 1)}])))
+
+(defn peek-char [state] (first (:buf state)))
 
 (defn classify-word
   [word]
@@ -84,45 +85,39 @@
       :else                                          :object-identifier)))
 
 (defn get-token
-  ([buf]
-   (get-token buf ""))
-  ([buf word]
-   (if (valid-body-char? (first buf))
-     (recur (rest buf) (str word (first buf)))
+  ([state]
+   (get-token state ""))
+  ([state word]
+   (if (valid-body-char? (peek-char state))
+     (let [[c new-state] (next-char state)]
+       (recur new-state (str word c)))
      (let [tag (classify-word word)]
-       [buf [word tag]]))))
-
-; descobrir como parar em caso de erro
-; provavelmente no parser, ja que o lexer vai apenas retornar o token,
-; while (true)
-;   tok = lex(buf)
-;   if (erro)...
+       [state [word tag]]))))
 
 (defn ignore-singleline-comment
-  [buf]
-  (let [c (first buf)]
+  [state]
+  (let [c (peek-char state)]
     (if (or (= c \newline) (nil? c))
-      (rest buf)
-      (recur (rest buf)))))
+      (second (next-char state))
+      (recur (second (next-char state))))))
 
 (defn ignore-multiline-comment
-  ([buf row col]
-   (ignore-multiline-comment buf row col '()))
-  ([buf row col stack]
-   (let [[c1 c2 & tail] buf]
+  ([state]
+   (ignore-multiline-comment state '()))
+  ([state stack]
+   (let [[c1 new-state] (next-char state)
+          c2            (peek-char state)]
      (cond
        (nil? c1)
        (die "erro: comentário multilinha não foi fechado")
        (= (str c1 c2) "(*")
-       (recur tail row (+ col 2) (cons \( stack))
+       (recur (second (next-char state)) (cons \( stack))
        (= (str c1 c2) "*)")
        (if (empty? (rest stack))
-         [tail row (+ col 2)]
-         (recur tail row (+ col 2) (rest stack)))
-       (= c1 \newline)
-       (recur (rest buf) (+ row 1) 1 stack)
+         new-state
+         (recur (second (next-char state)) (rest stack)))
        :else
-       (recur (rest buf) row (+ col 1) stack)))))
+       (recur new-state stack)))))
 
 ; para testes:
 ; (get-string '(\" \o \l \a \backspace \m \u \n \d \o))
@@ -131,75 +126,65 @@
 ; (get-string '(\" \o \l \a \backspace \\ \newline \m \u \n \d \o))
 ; TODO: verificar se a string tem EOF e \0 (de acordo com o manual)
 (defn get-string
-  ([buf]
-   (get-string (rest buf) "\""))
-  ([buf string]
+  ([state]
+   (get-string (second (next-char state)) "\""))
+  ([state string]
+   (let [[c1 new-state] (next-char state)
+          c2            (peek-char new-state)] ; gambiarra?
    (cond
-      ;; tem que ver a situacao em que o buffer fica vazio e é necessario recarregar.
-      ;; no momento, a ideia é usar algo parecido em C, com um vetor circular de tamanho
-      ;; 2 * BUFFER_SIZE, e fazer fread com tamanho BUFFER_SIZE (no caso, esta usando 2 buffers
-      ;; na mesma posição da memoria: [buf1][buf2]; é necessario verificar se
-      ;; é possivel fazer isso em clojure)
-     (nil? (first buf))        (die "Falta fechar a string.")
-     (= \u0000 (first buf))    (die "Caractere nulo '\\0' encontrado na string.")
-     (= \newline (first buf))  (die "Faltou escapar o '\\n'")
-     (= (first buf) \\)        (let [[c1 c2 & tail] buf] (recur tail (str string c1 c2)))
-     (quote? (first buf))      [(rest buf) [(str string \") :string]]
-     :else                     (recur (rest buf) (str string (first buf))))))
+     (nil? c1)        (die "Falta fechar a string.")
+     (= \u0000 c1)    (die "Caractere nulo '\\0' encontrado na string.")
+     (= \newline c1)  (die "Faltou escapar o '\\n'")
+     (= \\ c1)        (recur (second (next-char state)) (str string c1 c2))
+     (quote? c1)      [new-state [(str string \") :string]]
+     :else            (recur new-state (str string c1))))))
 
+; TODO: descobrir como melhorar isso
 (defn get-operator
-  [buf]
-  (let [[c1 c2 & tail] buf]
+  [state]
+  (let [[c1 new-state] (next-char state)
+         c2            (peek-char state)]
     (cond
       ; provavelmente é melhor comparar char a char ao invés
       ; de construir uma string, porem, no momento,
       ; o objetivo não é ter performance maxima.
-      (= (str c1 c2) "<-")   [tail ["<-" :assign]]
-      (= (str c1 c2) "<=")   [tail ["<=" :leq]]
-      (= (str c1 c2) "=>")   [tail ["=>" :to]]
-      :else                  [(rest buf) [(str c1) (get single-char-ops c1)]])))
+      (= (str c1 c2) "<-")   [(second (next-char new-state)) ["<-" :assign]]
+      (= (str c1 c2) "<=")   [(second (next-char new-state)) ["<=" :leq]]
+      (= (str c1 c2) "=>")   [(second (next-char new-state)) ["=>" :to]]
+      :else                  [new-state [(str c1) (get single-char-ops c1)]])))
 
 (defn get-integer
-  [buf]
-  (let [[int-chars new-buf] (split-with #(Character/isDigit %) buf)
-        integer             (apply str int-chars)]
-    [new-buf [integer :integer]]))
+  ([state]
+   (get-integer state ""))
+  ([state string]
+   (let [[c new-state] (next-char state)]
+     (if (Character/isDigit c)
+       (recur new-state (str string c))
+       [new-state [string :integer]]))))
+
+(defn ignore-whitespace [state] (second (next-char state)))
 
 ; pode ser interessante mudar a ordem dos testes, para 
 ; diminuir os testes e melhorar a performance
+; TODO: descobrir como fazer a recursão. dessa forma NAO FUNCIONA, pois não é
+; possível pegar o erro.
 (defn lex
   ([buf]
-   (lex buf 1 1))
-  ([buf row col]
-   (let [[c & tail] buf]
-     (cond
-       (nil? c)
-       nil
-       (Character/isDigit c)
-       (let [[buf token] (get-integer buf)
-             [new-row new-col] (advance-cursor (first token) row col)]
-         [token buf new-row new-col])
-       (valid-first-char? c)
-       (let [[buf token] (get-token buf)
-             [new-row new-col] (advance-cursor (first token) row col)]
-         [token buf new-row new-col])
-       (quote? c)
-       (let [[buf token] (get-string buf)
-             [new-row new-col] (advance-cursor (first token) row col)]
-         [token buf new-row new-col])
-       (singleline-comment? buf)
-       (recur (ignore-singleline-comment buf) (+ row 1) 1)
-       (multiline-comment? buf)
-       (let [[buf new-row new-col] (ignore-multiline-comment buf row col)]
-         (recur buf new-row new-col))
-       (whitespace? c)
-       (let [[new-row new-col] (advance-cursor (str c) row col)]
-         (recur (rest buf) new-row new-col))
-      ; operator precisa ser depois de testar se é comentário, pois
-      ; comentários multilinha começam com '('
-       (operator? c)
-       (let [[buf token] (get-operator buf)
-             [new-row new-col] (advance-cursor (first token) row col)]
-         [token buf new-row new-col])
-       :else
-       [[c :error (str "Caractere inválido: " c)] tail row (+ col 1)]))))
+   (lex {:buf buf :row 1 :col 1}))
+  ([state]
+   (let [c (peek-char state)
+     fun (cond
+         (nil? c)                  nil
+         (Character/isDigit c)     get-integer
+         (valid-first-char? c)     get-token 
+         (quote? c)                get-string 
+         ; operator precisa ser depois de testar se é comentário, pois
+         ; comentários multilinha começam com '('
+         (operator? c)             get-operator
+         :else                     get-erro?)]
+
+    (cond
+      (singleline-comment? state) (recur ignore-singleline-comment)
+      (whitespace? c)             (recur ignore-whitespace)
+      (multiline-comment? state)  (recur ignore-multiline-comment)
+      :else (fun state)))))
