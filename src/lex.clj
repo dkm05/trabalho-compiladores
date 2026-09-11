@@ -26,6 +26,9 @@
    \) :rightparentheses
    \, :comma})
 
+(defn init-state [texto]
+  {:buf (seq texto) :row 1 :col 1})
+
 (def whitespace-chars
   #{\space \newline \formfeed \return \tab \v})
 
@@ -48,12 +51,13 @@
   (contains? single-char-ops c))
 
 (defn multiline-comment?
-  [[c1 c2]]
-  (and (= c1 \() (= c2 \*)))
+  [state]
+  (let [buf (:buf state)]
+    (and (= (first buf) \() (= (second buf) \*))))
 
-(defn singleline-comment?
-  [[c1 c2]]
-  (and (= c1 \-) (= c2 \-)))
+(defn singleline-comment? [state]
+  (let [buf (:buf state)]
+    (and (= (first buf) \-) (= (second buf) \-))))
 
 (defn is-keyword?
   [word]
@@ -65,7 +69,7 @@
 
 (defn next-char
   [state] 
-  (let [[buf row col] (vals state)]
+  (let [{:keys [buf row col]} state]
     (if (= (first buf) \newline)
       [(first buf) {:buf (rest buf) :row (+ row 1) :col 1}]
       [(first buf) {:buf (rest buf) :row row :col (+ col 1)}])))
@@ -97,25 +101,26 @@
 (defn ignore-singleline-comment
   [state]
   (let [c (peek-char state)]
-    (if (or (= c \newline) (nil? c))
-      (second (next-char state))
-      (recur (second (next-char state))))))
+    (cond
+      (nil? c) state
+      (= c \newline) (second (next-char state))
+      :else (recur (second (next-char state))))))
 
 (defn ignore-multiline-comment
   ([state]
    (ignore-multiline-comment state '()))
   ([state stack]
    (let [[c1 new-state] (next-char state)
-          c2            (peek-char state)]
+          c2            (peek-char new-state)]
      (cond
        (nil? c1)
        (die "erro: comentário multilinha não foi fechado")
        (= (str c1 c2) "(*")
-       (recur (second (next-char state)) (cons \( stack))
+       (recur (second (next-char new-state)) (cons \( stack))
        (= (str c1 c2) "*)")
        (if (empty? (rest stack))
-         new-state
-         (recur (second (next-char state)) (rest stack)))
+         (second (next-char new-state))
+         (recur (second (next-char new-state)) (rest stack)))
        :else
        (recur new-state stack)))))
 
@@ -135,7 +140,7 @@
      (nil? c1)        (die "Falta fechar a string.")
      (= \u0000 c1)    (die "Caractere nulo '\\0' encontrado na string.")
      (= \newline c1)  (die "Faltou escapar o '\\n'")
-     (= \\ c1)        (recur (second (next-char state)) (str string c1 c2))
+     (= \\ c1)        (recur (second (next-char new-state)) (str string c1 c2))
      (quote? c1)      [new-state [(str string \") :string]]
      :else            (recur new-state (str string c1))))))
 
@@ -143,7 +148,7 @@
 (defn get-operator
   [state]
   (let [[c1 new-state] (next-char state)
-         c2            (peek-char state)]
+         c2            (peek-char new-state)]
     (cond
       ; provavelmente é melhor comparar char a char ao invés
       ; de construir uma string, porem, no momento,
@@ -154,13 +159,13 @@
       :else                  [new-state [(str c1) (get single-char-ops c1)]])))
 
 (defn get-integer
-  ([state]
-   (get-integer state ""))
+  ([state] (get-integer state ""))
   ([state string]
-   (let [[c new-state] (next-char state)]
-     (if (Character/isDigit c)
-       (recur new-state (str string c))
-       [new-state [string :integer]]))))
+   (let [c (peek-char state)]
+     (if (and c (Character/isDigit c))
+       (let [[c2 new-state] (next-char state)]
+         (recur new-state (str string c2)))
+       [state [string :integer]]))))
 
 (defn ignore-whitespace [state] (second (next-char state)))
 
@@ -169,22 +174,25 @@
 ; TODO: descobrir como fazer a recursão. dessa forma NAO FUNCIONA, pois não é
 ; possível pegar o erro.
 (defn lex
-  ([buf]
-   (lex {:buf buf :row 1 :col 1}))
   ([state]
-   (let [c (peek-char state)
-     fun (cond
-         (nil? c)                  nil
-         (Character/isDigit c)     get-integer
-         (valid-first-char? c)     get-token 
-         (quote? c)                get-string 
-         ; operator precisa ser depois de testar se é comentário, pois
-         ; comentários multilinha começam com '('
-         (operator? c)             get-operator
-         :else                     get-erro?)]
-
-    (cond
-      (singleline-comment? state) (recur ignore-singleline-comment)
-      (whitespace? c)             (recur ignore-whitespace)
-      (multiline-comment? state)  (recur ignore-multiline-comment)
-      :else (fun state)))))
+   (let [c (peek-char state)]
+     (cond
+       (nil? c) nil
+       (whitespace? c)             (recur (ignore-whitespace state))
+       (singleline-comment? state) (recur (ignore-singleline-comment state))
+       (multiline-comment? state)  (recur (ignore-multiline-comment state))
+       :else
+       (let [{:keys [row col]} state
+         fun (cond
+           (Character/isDigit c) get-integer
+           (valid-first-char? c) get-token
+           (quote? c)            get-string
+           (operator? c)         get-operator
+           :else                 nil)]
+         
+         (if fun
+           (let [[next-state [valor tag]] (fun state)]
+             [next-state [valor tag row col]])
+           
+           (let [[bad-char next-state] (next-char state)]
+             [next-state [bad-char :error row col]])))))))
