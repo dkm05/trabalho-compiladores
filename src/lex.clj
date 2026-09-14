@@ -4,9 +4,9 @@
    [clojure.string :as str]))
 
 (def keyword-table
-  #{"class" "else" "fi" "if" "in" "inherits" "isvoid"
-    "let" "loop" "pool" "then" "while" "case" "esac"
-    "new" "of" "not"})
+  {"class" :class, "else" :else, "fi" :fi, "if" :if, "in" :in, "inherits" :inherits,
+   "isvoid" :isvoid, "let" :let, "loop" :loop, "pool" :pool, "then" :then,
+   "while" :while, "case" :case, "esac" :esac, "new" :new, "of" :of, "not" :not})
 
 (def single-char-ops
   {\+ :sum
@@ -82,7 +82,7 @@
     (cond
       (= word "self")                                :self-token
       (= word "SELF_TYPE")                           :self-type-token
-      (keyword-table low-word)                       :keyword
+      (is-keyword? low-word)                         (get keyword-table low-word)
       (and (= (first word) \t) (= low-word "true"))  :boolean
       (and (= (first word) \f) (= low-word "false")) :boolean
       (Character/isUpperCase (first word))           :type-identifier
