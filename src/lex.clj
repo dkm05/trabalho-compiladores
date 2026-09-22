@@ -20,8 +20,8 @@
    \@ :at
    \: :colon
    \; :semicolon
-   \{ :leftbracket
-   \} :rightbracket
+   \{ :leftbrace
+   \} :rightbrace
    \( :leftparentheses
    \) :rightparentheses
    \, :comma})
@@ -30,7 +30,7 @@
   {:buf (seq texto) :row 1 :col 1})
 
 (def whitespace-chars
-  #{\space \newline \formfeed \return \tab \v})
+  #{\space \newline \formfeed \return \tab})
 
 (defn quote? [c] (= c \"))
 
