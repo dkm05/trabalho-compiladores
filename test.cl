@@ -1,15 +1,14 @@
-cLaSs Main {
-  (* Comentario (* aninhado *) ! *)
-  x : Int <- ~1;
-  b : Bool <- tRuE;
-  
-  main(str : String) : SELF_TYPE {
-    lEt $ # in
-    iF b = fAlSe tHeN
-      x <- (x * 2) <= 10
-    eLsE
-      "String com \"escape\" e \
-quebra ignorada"
-    fI
-  };
+class Main inherits IO {
+    teste: Int;
+    lolol: String <- "oi";
+    main(): Object {
+        let hello: String <- "Hello, ",
+            name: String <- "",
+            ending: String <- "!\n"
+        in {
+            out_string("Please enter your name:\n");
+            name <- in_string();
+            out_string(hello.concat(name.concat(ending)));
+        }
+    };
 };

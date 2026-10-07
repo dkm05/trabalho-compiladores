@@ -372,10 +372,8 @@
           (recur next-state (conj tokens token)))
         (conj tokens ["EOF" :eof -1 -1])))))
 
-(defn -main [& args]
-  (let [filename (first args)]
-    (if (nil? filename)
-      (println "usage: clj -M -m parser <file.cl>")
-      (let [tokens (lex-all filename)
-            [ast _] (parse-program tokens)]
-        (pprint/pprint ast)))))
+(defn get-ast
+  [filename]
+  (let [tokens  (lex-all filename)
+        [ast _] (parse-program tokens)]
+    ast))
