@@ -1,0 +1,11 @@
+.cpcache/
+.nrepl-port
+.prepl-port
+*.jar
+*.class
+out/
+target/
+!resources/cool/runtime/*.class
+.DS_Store
+Thumbs.db
+*~

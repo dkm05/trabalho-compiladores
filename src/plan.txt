@@ -1,0 +1,258 @@
+# Plano Técnico e Arquitetural — Backend Cool → JVM Bytecode
+
+Plano técnico e arquitetural para o backend **Cool → JVM Bytecode**, otimizado para **corretude semântica, segurança contra `VerifyError` e baixa superfície de bugs**, alinhado ao estado atual do front-end (Clojure 1.12 + OpenJDK 17).
+
+---
+
+## 1. Decisões Arquiteturais
+
+### 1.1 Estratégia de emissão de bytecode e dependências
+- **Escolha:** **OW2 ASM (`org.ow2.asm/asm` + `org.ow2.asm/asm-util`)** consumido diretamente via interop Java em Clojure, gerenciado por um `deps.edn` na raiz do projeto.
+- **Por que ASM (e não Jasmin, emissão binária manual ou `clojure.asm`):**
+  1. **`StackMapTable`, `maxStack` e `maxLocals` automáticos:** A JVM 17 exige `StackMapTable` válido em todo alvo de salto (`if`, `while`, `case`). Com `ClassWriter(COMPUTE_FRAMES | COMPUTE_MAXS)` (alvo `Opcodes/V1_8`), o ASM calcula frames e tamanhos de pilha automaticamente — eliminando a principal causa de `VerifyError`.
+  2. **Ponto crítico do `COMPUTE_FRAMES` (armadilha evitada desde o desenho):** Por padrão, `ClassWriter.getCommonSuperClass(t1, t2)` usa `Class.forName(...)` para calcular a junção de tipos nos frames. Como as classes Cool do usuário ainda não foram escritas/carregadas durante a compilação, isso lança `TypeNotFoundException`. **Solução:** criar uma subclasse de `ClassWriter` (via `proxy` em Clojure) sobrescrevendo `getCommonSuperClass` para consultar diretamente o `class-map` e `lca` (`semantic/hierarchy.clj`).
+  3. **Verificação em tempo de compilação:** `org.ow2.asm/asm-util` fornece `CheckClassAdapter` (valida bytecode gerado antes mesmo de rodar `java`) e `TraceClassVisitor` (útil em testes unitários, além de `javap -v -c`).
+  4. **Por que não usar `clojure.asm`:** O ASM interno do Clojure é versão antiga/reduzida e não é API pública nem traz `asm-util`.
+  5. **Por que não Jasmin:** Adiciona geração/parse de texto, processo externo e cálculo manual de pilha/frames.
+
+---
+
+### 1.2 Classes básicas, representação de valores e runtime
+- **Modelo uniforme de objetos boxed (`CoolObject` na raiz):**
+  - Toda expressão, variável local, parâmetro, atributo e retorno em Cool é representada na JVM como uma referência de objeto (`L...;`) subtipo de `cool/runtime/CoolObject` (1 slot na pilha/locais, sem mistura entre primitivos `I`/`Z` e referências).
+  - **Justificativa:** Em Cool, `Int`, `String` e `Bool` herdam de `Object`, aceitam chamadas de método (`42.type_name()`, `true.copy()`, `42.abort()`), entram em `Object` sem coerção (`if c then 1 else "a" fi`) e participam de `case` dinâmico. O boxing uniforme elimina 100% da complexidade de boxing/unboxing condicional em `if`, `case`, `let`, `Assign` e polimorfismo, mantendo operações aritméticas simples (unbox `.value` → instrução `iadd`/`isub`/`imul`/`ineg` → `CoolInt.of(...)`).
+- **Pacote e runtime escrito em Java (`runtime/cool/runtime/*.java`):**
+  - As 5 classes básicas + utilitários ficam no pacote Java `cool.runtime` (compiladas via `javac` e copiadas para `<out>/cool/runtime/` pelo compilador, para que `java -cp out Main` seja 100% autocontido):
+    - `Object` → `cool/runtime/CoolObject`: Implementa `Cloneable`. `abort()` imprime `"Abort called from class <Nome>"` e chama `System.exit(1)`. `copy()` usa `super.clone()` (cópia rasa nativa da subclasse dinâmica exata, sem reexecutar inicializadores). `type_name()` resolve dinamicamente o nome Cool a partir de `this.getClass()` (mapeando as 5 básicas para `"Object"`, `"IO"`, `"Int"`, `"String"`, `"Bool"` e usando `getName()` para classes do usuário — nunca sobrescrevendo `type_name()` em `CoolIO`, senão subclasses de `IO` retornariam `"IO"`).
+    - `IO` → `cool/runtime/CoolIO`: Herda de `CoolObject`. Mantém um único `BufferedReader` estático compartilhado entre `in_string()` e `in_int()` (evita perda de buffer em leituras intercaladas). `out_string`/`out_int` fazem `flush()` e retornam `this`. `in_string()` lê até `\n` (sem incluir `\n`, retorna `""` no EOF). `in_int()` lê a linha, ignora espaços iniciais, faz parse do inteiro opcionalmente sinalizado e retorna `0` se inválido/EOF (sem lançar exceção).
+    - `Int` → `cool/runtime/CoolInt`: `final`, herda de `CoolObject`, campo `public final int value`, constante `ZERO`, fábrica `CoolInt.of(int)` (pode cachear pequenos inteiros).
+    - `String` → `cool/runtime/CoolString`: `final`, herda de `CoolObject`, campo `public final String value`, constante `EMPTY`, fábrica `CoolString.of(String)`. `length()`, `concat(CoolString)`, `substr(CoolInt i, CoolInt l)` (atenção: em Cool o 2º parâmetro é comprimento `l`, não índice final; validar `i < 0 || l < 0 || (long)i + (long)l > value.length()` antes de `substring(i, i + l)`).
+    - `Bool` → `cool/runtime/CoolBool`: `final`, herda de `CoolObject`, campo `public final boolean value`, singletons `TRUE` e `FALSE`, fábrica `CoolBool.of(boolean)`.
+    - *(helpers)* → `cool/runtime/CoolRuntime`: Métodos estáticos para igualdade `=`, `isvoid`, `not`, `<`, `<=`, `/`, checagens de `void` (dispatch/case) e aborto de `case` sem ramo.
+- **Classes do usuário e name mangling (zero colisões com a JVM):**
+  - Classes do usuário são emitidas no **pacote default** com o nome exato da classe Cool (`Main.class`, `Foo.class`), garantindo que `java -cp out Main` funcione diretamente.
+  - **Convenção de nomes internos:**
+    - Todos os métodos Cool recebem prefixo `cool$` (ex.: `cool$main`, `cool$abort`, `cool$out_string`) e versão estática `cool$static$<nome>` (ver item 1.5).
+    - Todos os atributos Cool recebem prefixo `attr$` (ex.: `attr$x`) com visibilidade `ACC_PUBLIC` (o encapsulamento já foi garantido pelo semântico; isso elimina qualquer atrito de `ACC_PROTECTED` entre pacotes ou métodos estáticos).
+    - **Benefício:** Elimina colisões com métodos de `java.lang.Object` (`wait`, `getClass`, `clone`, `equals`, `toString`, `hashCode`, `finalize`), com `public static void main(String[])`, com palavras reservadas do Java e entre atributos e métodos Cool de mesmo nome.
+- **Entrypoint em `Main`:**
+  - Ao emitir `Main.class`, gerar também `public static void main(String[] args)` que instancia `Main`, executa o protocolo de inicialização (item 1.4) e chama `cool$main()`.
+
+---
+
+### 1.3 Acesso a tipos estáticos no codegen (Anotação da AST no semântico)
+- **Decisão:** **Anotar a AST no semântico** (`semantic/typecheck.clj`) e enriquecer o `class-map` em `semantic/hierarchy.clj`.
+- **Por quê:** Evita duplicar regras de escopo, `SELF_TYPE`, `lca` e resolução de dispatch no codegen (fonte única da verdade). Como os nós em `ast.clj` são `defrecord`, associar chaves extras (`assoc`) é idiomático, preserva o tipo do record para `defmulti` e não quebra os testes existentes.
+- **Alterações pontuais no front-end:**
+  1. Em `semantic/hierarchy.clj`:
+     - Preservar em cada classe de `class-map` os vetores ordenados `:own-attributes` e `:own-methods` (extraídos de `(:features cls)` na ordem textual).
+     - Registrar `:defining-class` em cada `Method` e `Attribute` ao achatar a herança em `merge-ancestor` (necessário para saber a classe dona do campo em `getfield`/`putfield` e o alvo exato de `invokestatic` no dispatch estático).
+     - Expor uma função auxiliar `class-depth` (profundidade na árvore de herança a partir de `Object = 0`, usada no `case`).
+  2. Em `semantic/typecheck.clj`:
+     - Fazer `type-of` retornar o nó anotado com `:inferred-type` (e atualizar os filhos recursivamente).
+     - Fazer `verify-program-types` retornar o `class-map` atualizado com as ASTs de métodos (`:body`) e atributos (`:init`) anotadas (inclusive dentro de `:own-attributes` / `:own-methods`).
+  3. **Atenção aos literais vindos de `lex.clj`:**
+     - `IntLit` chega com `:value` como `String` (ex.: `"42"`) → converter com `Integer/parseInt`.
+     - `BoolLit` chega como `String` (`"true"`, `"tRuE"`, `"false"`) → testar `(= \t (first value))`.
+     - `StringLit` chega com as aspas externas `"..."` e escapes crus do Cool (`\n`, `\t`, `\b`, `\f`, `\\`, `\"`, `\<newline>` → `\n`, `\c` → `c`) → criar um helper dedicado `unescape-cool-string` no backend antes do `ldc`.
+
+---
+
+### 1.4 Ciclo de vida de objetos, valores padrão e construtores na JVM
+- **Armadilha clássica evitada:** Segundo a semântica operacional do Cool (Manual §13.3), ao executar `new C`, **todos os atributos de toda a cadeia de herança (`Object` até `C`) devem receber seus valores padrão ANTES que qualquer expressão de inicialização execute**. Se um construtor de superclasse `A` rodar seu `init` dentro de `A.<init>()` e chamar um método sobrescrito em `B` que lê um atributo `y : Int` de `B`, o `y` ainda seria `null` em vez de `0` (causando `NullPointerException` no unboxing!).
+- **Solução em duas fases (`<init>` + `cool$$init`):**
+  1. **Fase 1 — `<init>()V` (somente valores padrão):**
+     - Chama `super.<init>()V`.
+     - Inicializa apenas os `:own-attributes` da classe com seus valores padrão Cool:
+       - `Int` → `CoolInt.ZERO`
+       - `String` → `CoolString.EMPTY`
+       - `Bool` → `CoolBool.FALSE`
+       - Qualquer outra classe ou `SELF_TYPE` → `null`
+     - Não executa nenhuma expressão `:init`.
+  2. **Fase 2 — `public void cool$$init()` (expressões `:init` em ordem ancestral → subclasse, ordem textual):**
+     - `CoolObject` define `public void cool$$init() {}`.
+     - Cada classe do usuário `C` define `cool$$init()`:
+       1. Chama `invokespecial Parent.cool$$init()V` (garante execução do maior ancestral até `C`).
+       2. Percorre `:own-attributes` de `C` **na ordem textual de declaração**; para cada atributo com `:init` não-nulo, avalia a expressão com `self` no slot `0` e grava via `putfield C.attr$<nome>`.
+  3. **Alocação (`new T`):**
+     - Para `Int`/`String`/`Bool`: carrega diretamente `CoolInt.ZERO` / `CoolString.EMPTY` / `CoolBool.FALSE` (conforme Cool Manual).
+     - Para classes `Object`/`IO` e classes do usuário `T`:
+       ```text
+       new T
+       dup
+       invokespecial T.<init>()V
+       dup
+       invokevirtual T.cool$$init()V
+       ```
+  - **Vantagem extra:** `Object.copy()` (via `super.clone()`) copia o estado atual dos atributos sem nunca reexecutar `cool$$init()`.
+
+---
+
+### 1.5 Despacho e `SELF_TYPE`
+1. **Ordem de avaliação no despacho (Cool Manual §13.3):**
+   - Em `e0.m(e1, ..., en)` e `e0@T.m(e1, ..., en)`, Cool avalia **primeiro os argumentos `e1..en` da esquerda para a direita**, e **por último o receptor `e0`**, só então verificando se `e0` é `void`.
+   - **Emissão:** quando `n > 0`, avaliar `e1..en` salvando cada resultado em slots locais temporários; avaliar `e0`; chamar `CoolRuntime.checkDispatchNotVoid(e0, file, line)`; recolocar `e0` e os temporários na pilha; invocar o método.
+   - Em `Call` implícito (`m(e1, ..., en)`), o receptor é `self` (`aload_0`, puro e nunca `void`), então empilha-se `aload_0`, avaliam-se `e1..en` direto na pilha e emite-se `invokevirtual`.
+
+2. **Despacho estático (`e0@T.m(...)`) sem `VerifyError`:**
+   - **Armadilha da JVM evitada:** Na JVM, `invokespecial` só pode chamar métodos de superclasse quando a classe atual é subclasse do alvo e o receptor é `this`. Em Cool, `Main` pode executar `b@A.f()` mesmo sem herdar de `A`, o que causaria `VerifyError`/`IllegalAccessError` com `invokespecial`.
+   - **Solução (corpo estático + delegador virtual):**
+     - Todo método `m(p1: T1, ..., pn: Tn): R` definido na classe `C` tem seu corpo compilado em um método **`public static`** na própria classe `C`:
+       `public static <R_jvm> cool$static$m(C self, T1 p1, ..., Tn pn)` (note que o slot `0` continua sendo `self` e os formais ficam nos slots `1..n` — layout idêntico ao de instância!).
+     - O método virtual **`public <R_jvm> cool$m(T1 p1, ..., Tn pn)`** apenas delega: `aload_0..aload_n; invokestatic C.cool$static$m(...); areturn`.
+     - As classes básicas (`CoolObject`, `CoolIO`, `CoolString`) expõem o mesmo par `cool$m` + `cool$static$m`.
+     - **Despacho dinâmico** usa `invokevirtual <target>.cool$m(...)`.
+     - **Despacho estático `e0@T.m(...)`** consulta o `:defining-class` `D` do método `m` em `T` no `class-map` e emite `invokestatic D.cool$static$m(LD;...)`. Funciona a partir de **qualquer classe**, sem `invokespecial`, mantendo `self` com seu tipo dinâmico real!
+
+3. **Métodos e atributos com `SELF_TYPE` (descritores invariantes na JVM):**
+   - **Problema:** Na JVM, sobrescrita exige descritor idêntico (inclusive tipo de retorno). Se `A.cool$me()` retornasse `LA;` e `B.cool$me()` retornasse `LB;`, a JVM não os trataria como override (quebrando polimorfismo!).
+   - **Solução uniforme (erasure para `CoolObject` + `checkcast` no ponto de uso):**
+     - Todo método cujo retorno Cool é `"SELF_TYPE"` (incluindo `Object.copy` e `IO.out_string`/`out_int`) tem tipo de retorno JVM `Lcool/runtime/CoolObject;`. Isso garante descritores 100% idênticos em toda a hierarquia, **sem precisar de bridge methods**.
+     - No ponto de chamada (`Call`/`Dispatch`), se o método retorna `"SELF_TYPE"` e o tipo estático inferido da chamada é `T` (onde `T = current-class` se `"SELF_TYPE"`, ou o tipo do receptor), emite-se `checkcast <T_jvm>` (exceto se `T = "Object"`). O sistema de tipos do Cool garante que esse cast nunca falha em runtime.
+     - Mesma regra para **atributos** declarados com tipo `SELF_TYPE`: o campo JVM tem tipo `Lcool/runtime/CoolObject;`, e ao lê-lo (`getfield`) dentro de `current-class`, emite-se `checkcast <current-class>` (seguro inclusive para `null`).
+
+4. **`new SELF_TYPE` em tempo de execução:**
+   - Em vez de reflection (`Class.getDeclaredConstructor()`), cada classe (inclusive as 5 básicas no runtime) define um método virtual fábrica:
+     `public CoolObject cool$$newInstance()`
+   - Em cada classe do usuário `C`, `cool$$newInstance()` executa `new C; dup; invokespecial C.<init>()V; dup; invokevirtual C.cool$$init()V; areturn`.
+   - Em `CoolInt`/`CoolString`/`CoolBool`, retorna `ZERO`/`EMPTY`/`FALSE`.
+   - Compilar `new SELF_TYPE` reduz-se a:
+     ```text
+     aload_0
+     invokevirtual cool/runtime/CoolObject.cool$$newInstance()Lcool/runtime/CoolObject;
+     checkcast <current-class>
+     ```
+   - Despacha virtualmente para a classe dinâmica exata de `self`, com zero reflection e zero problemas de visibilidade no Java 17.
+
+---
+
+### 1.6 Expressões, semântica operacional e erros de runtime
+- **Invariante fundamental do codegen:** **Toda expressão Cool deixa exatamente 1 referência (`CoolObject` ou subtipo) na pilha.** Em `Block` (todas exceto a última expressão) e no corpo do `While`, emite-se `pop` imediatamente após a expressão.
+- **`case` (ancestral mais próximo em runtime):**
+  1. Avalia `e0`, valida `CoolRuntime.checkCaseNotVoid(e0, file, line)` e salva em um slot temporário `v`.
+  2. **Ordenação estática por profundidade decrescente na árvore de herança** (`class-depth` do maior para o menor, `"Object"` por último). Como Cool tem herança simples (árvore) e o semântico garante tipos de ramo distintos, o **primeiro** `instanceof Tk` verdadeiro em runtime é matematicamente garantido como o ancestral mais próximo!
+  3. Para cada ramo `(xk, Tk, ek)` ordenado: `aload v; instanceof Tk; ifeq L_next; aload v; checkcast Tk; astore slot_xk; <emit ek>; goto L_end; L_next:`.
+  4. No fallthrough (nenhum ramo compatível): chamar `CoolRuntime.caseNoMatch(v, file, line)` (que imprime erro + nome dinâmico + linha, chama `System.exit(1)` e tem tipo de retorno `RuntimeException`) seguido de `athrow` — o `athrow` informa ao `COMPUTE_FRAMES` do ASM que esse caminho não chega em `L_end`, mantendo o frame de merge limpo.
+- **Igualdade `=` (`BinaryOp :eq`):**
+  - Avalia `left`, depois `right` (esquerda → direita), e chama `CoolRuntime.coolEquals(a, b)`:
+    1. `a == b` → `TRUE` (cobre `void = void` e identidade de objetos).
+    2. `a == null || b == null` → `FALSE`.
+    3. Se ambos `CoolInt` / `CoolBool` / `CoolString` → compara `.value` (funciona tanto estaticamente quanto dinamicamente quando valores básicos estão em variáveis do tipo `Object`, conforme Cool Manual §13.3).
+    4. Caso contrário → `FALSE`.
+- **`let` (escopo, inicialização sequencial e shadowing):**
+  - O ambiente de variáveis locais no codegen é um mapa imutável `{nome -> slot}` somado a um alocador de novos slots.
+  - Para cada `Binding` de `Let`, avalia-se `:init` (ou empilha-se o valor padrão do `:declared-type` se `:init` for `nil`) **no ambiente anterior**, aloca-se um **novo slot** (nunca sobrescrevendo o slot de variáveis sombreadas), emite-se `astore slot`, e prossegue-se com `(assoc locals nome slot)`.
+  - Resolução de `Id`/`Assign`: `self` → `aload_0`; presente em `locals` → `aload`/`dup; astore`; caso contrário → atributo da classe (`aload_0; getfield` ou `aload_0; <emit expr>; dup_x1; putfield`, preservando o valor atribuído no topo da pilha).
+- **`while`:**
+  - `L_cond:` avalia `cond`, unbox `CoolBool.value`, `ifeq L_end`, avalia `body`, **`pop`**, `goto L_cond`, `L_end: aconst_null` (retorna `void` de tipo `Object`).
+- **`if`:**
+  - Avalia `cond`, unbox `CoolBool.value`, `ifeq L_else`, avalia `then`, `goto L_end`, `L_else:`, avalia `else`, `L_end:`.
+- **`isvoid`, `not`, `<`, `<=`, `+`, `-`, `*`, `/`, `~`:**
+  - Avaliação sempre estrita esquerda → direita.
+  - `+`, `-`, `*`: unbox `CoolInt.value`, `iadd`/`isub`/`imul` (32-bit two's complement), `CoolInt.of`.
+  - **`~` (`:intcomplement`):** Atenção ao Cool Manual §13.3 (`[Neg]`): `~e` é **negação aritmética em complemento de dois (`-i`, instrução JVM `ineg`)**, e **não** NOT bit-a-bit!
+  - `/`: unbox ambos e delega para `CoolRuntime.div(a, b, file, line)` (verifica `b == 0`).
+  - `<`, `<=`, `not`, `isvoid`: delegam para `CoolRuntime.lt`, `leq`, `not`, `isVoid` (evita labels desnecessários no bytecode).
+- **Resumo dos erros de runtime (todos via `CoolRuntime` / `CoolString`, imprimindo diagnóstico com linha e encerrando com `System.exit(1)`):**
+  1. Dispatch em `void` (`checkDispatchNotVoid`).
+  2. `case` em `void` (`checkCaseNotVoid`).
+  3. `case` sem ramo compatível (`caseNoMatch`).
+  4. Divisão por zero (`div`).
+  5. `String.substr(i, l)` fora do intervalo (em `CoolString.cool$substr`).
+
+---
+
+## 2. Estrutura de Arquivos e Dependências
+
+### 2.1 Dependências (`deps.edn` na raiz do repositório)
+```clojure
+{:paths ["src" "resources"]
+ :deps {org.clojure/clojure {:mvn/version "1.12.0"}
+        org.ow2.asm/asm     {:mvn/version "9.7.1"}
+        org.ow2.asm/asm-util {:mvn/version "9.7.1"}}}
+```
+
+### 2.2 Novos arquivos e módulos do backend + runtime
+```text
+trabalho-compiladores/
+├── deps.edn                           # Dependências (ASM + ASM-Util) e :paths
+├── runtime/
+│   └── cool/runtime/
+│       ├── CoolObject.java            # Object (abort, type_name, copy, cool$$init, cool$$newInstance)
+│       ├── CoolIO.java                # IO (out_string, out_int, in_string, in_int + static trampolines)
+│       ├── CoolInt.java               # Int (value, ZERO, of)
+│       ├── CoolString.java            # String (value, EMPTY, of, length, concat, substr + checks)
+│       ├── CoolBool.java              # Bool (value, TRUE, FALSE, of)
+│       └── CoolRuntime.java           # coolEquals, div, lt, leq, not, isVoid, void/case checks
+├── resources/
+│   └── cool/runtime/*.class           # Classes compiladas do runtime (geradas por script/build via javac)
+└── src/
+    ├── compiler.clj                   # CLI principal: clj -M -m compiler <arquivo.cl> [-o out]
+    ├── semantic.clj                   # (Ajuste) Passa a retornar class-map anotado
+    ├── semantic/
+    │   ├── hierarchy.clj              # (Ajuste) :own-attributes, :own-methods, :defining-class, class-depth
+    │   └── typecheck.clj              # (Ajuste) Anota :inferred-type na AST e retorna class-map anotado
+    └── codegen/
+        ├── types.clj                  # Mapeamento Cool <-> JVM internal names/descriptors, mangling, unescape de StringLit
+        ├── asm.clj                    # CoolClassWriter (getCommonSuperClass via lca), helpers de emissão e verificação (CheckClassAdapter)
+        ├── expr.clj                   # defmulti emit-expr para todos os 17 nós de expressão da AST
+        ├── class_gen.clj              # Emissão de .class: campos, <init>, cool$$init, cool$$newInstance, métodos (static+virtual), Main.main
+        └── core.clj                   # Orquestrador: compila todas as classes do usuário, grava .class e copia runtime para out/
+```
+
+---
+
+## 3. Roteiro Incremental de Implementação e Testes
+
+Cada etapa termina com compilação real para `.class`, validação automática via **`CheckClassAdapter`** e execução real via **`java -cp out Main`** comparando `stdout`, `stderr` e `exit code` esperados.
+
+### Etapa 0 — Infraestrutura, Runtime Java e Anotação do Semântico
+- **Escopo:**
+  - Criar `deps.edn` com `org.ow2.asm/asm` e `asm-util`.
+  - Implementar e compilar as 6 classes em `runtime/cool/runtime/*.java` (com testes unitários via Clojure interop testando `substr`, `in_int`, `coolEquals`, `copy`, `type_name`).
+  - Aplicar os ajustes em `semantic/hierarchy.clj` (`:own-attributes`, `:own-methods`, `:defining-class`, `class-depth`) e `semantic/typecheck.clj` (`:inferred-type` nos nós), garantindo que toda a suíte atual de `test_runner.clj` continue 100% verde.
+- **Validação:** Suíte semântica passando + inspeção de uma AST anotada + runtime Java testado isoladamente.
+
+### Etapa 1 — Esqueleto ASM, `Main` e "Hello World" (`IO` + Literais + `Call`)
+- **Escopo:**
+  - Criar `codegen/types.clj` (incluindo `unescape-cool-string`), `codegen/asm.clj` (`CoolClassWriter` + `CheckClassAdapter`), `codegen/class_gen.clj` (esqueleto `<init>`, `cool$$init`, `cool$$newInstance`, método `static`+`virtual`, `Main.main`) e `codegen/core.clj`.
+  - Implementar `emit-expr` para `IntLit`, `StringLit`, `BoolLit`, `Id` (`self`), `Block`, `Call` e `Dispatch` dinâmico básico.
+- **Validação na JVM:** Compilar `class Main inherits IO { main() : Object { out_string("Hello, Cool!\n") }; };` e programas com escapes (`\n`, `\t`, `\"`, `\\`) e encadeamento `out_string("x=").out_int(42)`. Executar `java -cp out Main` e validar saída exata + `javap -c out/Main.class`.
+
+### Etapa 2 — Operadores, Fluxo de Controle e Escopo (`if`, `while`, `let`, `Assign`)
+- **Escopo:**
+  - Implementar `BinaryOp` (`+`, `-`, `*`, `/`, `<`, `<=`, `=`), `UnaryOp` (`~`, `not`, `isvoid`), `If`, `While`, `Let` (com defaults e shadowing) e `Assign` em variáveis locais/parâmetros.
+- **Validação na JVM:** Compilar e executar programas de fatorial iterativo (`while`), Fibonacci recursivo (`if`), `let` com shadowing aninhado (mesmo nome mudando de `Int` para `String`), negação `~`, `while` usado como expressão `Object` (`isvoid (while false loop 1 pool)` → `true`), e divisão por zero retornando exit code `1`.
+
+### Etapa 3 — Objetos, Atributos, Herança e Ciclo de Vida em 2 Fases
+- **Escopo:**
+  - Implementar atributos em `<init>` (defaults) e `cool$$init` (ordem ancestral → subclasse, ordem textual), `Id`/`Assign` em atributos (próprios e herdados), e `New` para tipos concretos (incluindo `new Int`, `new String`, `new Bool`).
+- **Validação na JVM:**
+  - Teste de ordem de inicialização (atributos `a1`, `a2` usando `a1`, herança em 3 níveis `A <- B <- C`).
+  - **Teste de regressão da armadilha de 2 fases:** superclasse `A` inicializando atributo chamando método virtual sobrescrito em `B` que lê atributo `Int`/`String` de `B` — deve ler `0`/`""` sem `NullPointerException`.
+  - Teste de `copy()` comprovando cópia rasa (alterar atributo primitivo/referência na cópia não altera o original, mas objeto referenciado é compartilhado) e que `cool$$init` não reexecuta no `copy()`.
+
+### Etapa 4 — Polimorfismo, Despacho Estático (`@Tipo`) e `SELF_TYPE`
+- **Escopo:**
+  - Implementar despacho estático (`e0@T.m(...)` via `invokestatic D.cool$static$m`), ordem de avaliação estrita (argumentos antes do receptor + `checkDispatchNotVoid`), `checkcast` para retornos/atributos `SELF_TYPE` e `new SELF_TYPE` via `cool$$newInstance()`.
+- **Validação na JVM:**
+  - Teste de despacho estático a partir de classe não relacionada (`Main` chamando `b@A.f()`).
+  - Teste de override de método retornando `SELF_TYPE` (chamada polimórfica via referência de superclasse + encadeamento fluente).
+  - Teste de `new SELF_TYPE` definido em `A` e chamado sobre instância de `B` (`(new B).make().type_name()` === `"B"` com atributos de `B` inicializados).
+  - Teste de ordem de avaliação em `e0.f(e1, e2)` com efeitos colaterais (atribuições/prints comprovando ordem `e1` → `e2` → `e0`).
+  - Teste de dispatch em `void` (exit code `1` após avaliar argumentos).
+
+### Etapa 5 — `case`, Igualdade Dinâmica e Erros de Runtime Completos
+- **Escopo:**
+  - Implementar `Case` com ordenação decrescente por `class-depth`, `checkCaseNotVoid` e `caseNoMatch`.
+  - Validar todos os cantos de `=`, `IO.in_string`/`in_int`, `String.substr` e `Object.abort`.
+- **Validação na JVM:**
+  - Hierarquia em 4 níveis com ramos fora de ordem no `case` (incluindo `Int`/`String`/`Bool`/`Object`), verificando seleção do ancestral mais próximo.
+  - `case` em `void` e `case` sem ramo compatível (exit code `1`).
+  - `=` com `Int`/`String`/`Bool` armazenados em variáveis `Object` (`let x : Object <- 5, y : Object <- 5 in x = y` → `true`), `void = void` → `true`, objetos distintos → `false`.
+  - `substr` válido e fora dos limites (índice negativo, tamanho negativo, overflow `i + l`), `in_string` + `in_int` com `stdin` redirecionado.
+
+### Etapa 6 — CLI Final e Suíte End-to-End de Programas Reais Cool
+- **Escopo:**
+  - Criar `src/compiler.clj` (`clj -M -m compiler programa.cl -o out`) e um runner de testes end-to-end que compila, verifica com `CheckClassAdapter`, executa `java -cp <tmp-out> Main` e compara stdout/exit code.
+- **Validação na JVM:** Compilar e executar programas Cool clássicos completos (lista ligada polimórfica `List`/`Cons`/`Nil`, árvore binária, parser/calculadora ou `primes.cl`/`atoi.cl` do conjunto de exemplos padrão do Cool).

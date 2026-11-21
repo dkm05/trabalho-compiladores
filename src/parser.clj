@@ -1,6 +1,7 @@
 (ns parser
   (:require [clojure.pprint :as pprint]
             [clojure.string :as str]
+            [ast :as ast]
             [lex :as lex])
   (:gen-class))
 
@@ -63,11 +64,7 @@
 (defn parse-formal [tokens]
   (let [[row col] (peek-pos tokens)
         [id type-id tokens] (parse-type-id tokens)]
-    [{:type :formal 
-      :name id 
-      :declared-type type-id 
-      :row row 
-      :col col} tokens]))
+    [(ast/->Formal id type-id row col) tokens]))
 
 (defn parse-feature [tokens]
   (let [[row col]     (peek-pos tokens)
@@ -83,24 +80,13 @@
             tokens               (skip tokens :leftbrace)
             [body tokens]        (parse-expr tokens)
             tokens               (skip tokens :rightbrace)]
-        [{:type :method 
-          :name name 
-          :return-type return-type 
-          :formals formals 
-          :body body 
-          :row row 
-          :col col} tokens])
+        [(ast/->Method name return-type formals body row col) tokens])
       (= next-tag :colon)
       (let [tokens               (skip tokens :colon)
             [attr-type tokens]   (expect tokens #{:type-identifier :self-type-token})
             [has-assign? tokens] (accept tokens :assign)
             [init tokens]        (if has-assign? (parse-expr tokens) [nil tokens])]
-        [{:type :attribute 
-          :name name 
-          :declared-type attr-type 
-          :init init 
-          :row row 
-          :col col} tokens])
+        [(ast/->Attribute name attr-type init row col) tokens])
 
       :else
       (throw (ex-info (str "Erro sintático dentro de parse-feature") {})))))
@@ -117,20 +103,17 @@
         [features tokens]      (parse-semicolon-terminated tokens parse-feature :rightbrace)
         tokens                 (skip tokens :rightbrace)]
 
-    [{:type :class
-      :name class-name
-      :inherits parent
-      :features features
-      :row row
-      :col col}
-     tokens]))
+    [(ast/->ClassDef class-name parent features row col) tokens]))
 
 ; -------------------- expr --------------------
 
-(defn parse-literal
-  [tokens]
-  (let [[val tag row col] (first tokens)]
-    [{:type tag :value val :row row :col col} (rest tokens)]))
+(defn parse-literal [tokens]
+  (let [[val tag row col] (first tokens)
+        node (case tag
+               :integer (ast/->IntLit val row col)
+               :string  (ast/->StringLit val row col)
+               :boolean (ast/->BoolLit val row col))]
+    [node (rest tokens)]))
 
 (defn parse-if
   [tokens]
@@ -142,13 +125,7 @@
         tokens              (skip tokens :else)
         [branch-f tokens]   (parse-expr tokens)
         tokens              (skip tokens :fi)]
-    [{:type :if
-      :cond condi
-      :then branch-t
-      :else branch-f
-      :row row
-      :col col}
-     tokens]))
+    [(ast/->If condi branch-t branch-f row col) tokens]))
 
 (defn parse-while
   [tokens]
@@ -158,30 +135,21 @@
         tokens              (skip tokens :loop)
         [loop-body tokens]   (parse-expr tokens)
         tokens              (skip tokens :pool)]
-    [{:type :while
-      :cond condi
-      :body loop-body
-      :row row
-      :col col}
-     tokens]))
+    [(ast/->While condi loop-body row col) tokens]))
 
 (defn parse-block [tokens]
   (let [[row col] (peek-pos tokens)
         tokens    (skip tokens :leftbrace)
         [exprs tokens] (parse-semicolon-terminated tokens parse-expr :rightbrace)
         tokens    (skip tokens :rightbrace)]
-    [{:type :block 
-      :body exprs 
-      :row row 
-      :col col} tokens]))
+    [(ast/->Block exprs row col) tokens]))
 
 (defn parse-binding [tokens]
-  (let [[id type-id curr] (parse-type-id tokens)
+  (let [[row col]         (peek-pos tokens)
+        [id type-id curr] (parse-type-id tokens)
         [has-init? curr]  (accept curr :assign)
         [init curr]       (if has-init? (parse-expr curr) [nil curr])]
-    [{:type type-id 
-      :id id 
-      :init init} curr]))
+    [(ast/->Binding id type-id init row col) curr]))
 
 (defn parse-let [tokens]
   (let [[row col] (peek-pos tokens)
@@ -189,19 +157,14 @@
         [bindings tokens] (parse-comma-separated tokens parse-binding :in)
         tokens    (skip tokens :in)
         [body tokens] (parse-expr tokens)]
-    [{:type :let 
-      :bindings bindings 
-      :body body 
-      :row row 
-      :col col} tokens]))
+    [(ast/->Let bindings body row col) tokens]))
 
 (defn parse-case-branch [tokens]
-  (let [[id type-id curr]  (parse-type-id tokens)
+  (let [[row col]          (peek-pos tokens)
+        [id type-id curr]  (parse-type-id tokens)
         curr               (skip curr :to)
         [branch-expr curr] (parse-expr curr)]
-    [{:type type-id 
-      :id id 
-      :expr branch-expr} curr]))
+    [(ast/->CaseBranch id type-id branch-expr row col) curr]))
 
 (defn parse-case [tokens]
   (let [[row col] (peek-pos tokens)
@@ -210,11 +173,7 @@
         tokens    (skip tokens :of)
         [branches tokens] (parse-semicolon-terminated tokens parse-case-branch :esac)
         tokens    (skip tokens :esac)]
-    [{:type :case 
-      :expr expr 
-      :cases branches 
-      :row row 
-      :col col} tokens]))
+    [(ast/->Case expr branches row col) tokens]))
 
 (defn parse-id-or-call [tokens]
   (let [[row col] (peek-pos tokens)
@@ -223,11 +182,8 @@
       (let [tokens (skip tokens :leftparentheses)
             [args tokens] (parse-comma-separated tokens parse-expr :rightparentheses)
             tokens (skip tokens :rightparentheses)]
-        [{:type :call :method id :args args :row row :col col} tokens])
-      [{:type :id 
-        :name id 
-        :row row 
-        :col col} tokens])))
+        [(ast/->Call id args row col) tokens])
+      [(ast/->Id id row col) tokens])))
 
 (defn parse-primary [tokens]
   (let [tag (peek-tag tokens)]
@@ -241,19 +197,13 @@
       (= tag :self-token)
       (let [[row col] (peek-pos tokens)
             tokens (skip tokens :self-token)]
-        [{:type :id 
-          :name "self" 
-          :row row 
-          :col col} tokens])
+        [(ast/->Id "self" row col) tokens])
       (= tag :object-identifier) (parse-id-or-call tokens)
       (= tag :new)
       (let [[row col] (peek-pos tokens)
             tokens (skip tokens :new)
-            [type-id tokens] (expect tokens :type-identifier)]
-        [{:type :new 
-          :type-id type-id 
-          :row row 
-          :col col} tokens])
+            [type-id tokens] (expect tokens #{:type-identifier :self-type-token})]
+        [(ast/->New type-id row col) tokens])
       (= tag :leftparentheses)
       (let [tokens (skip tokens :leftparentheses)
             [expr tokens] (parse-expr tokens)
@@ -275,13 +225,12 @@
                 curr-toks             (skip curr-toks :leftparentheses)
                 [args curr-toks]      (parse-comma-separated curr-toks parse-expr :rightparentheses)
                 curr-toks             (skip curr-toks :rightparentheses)
-                base-node             {:type :dispatch 
-                                       :obj curr-left 
-                                       :method method-id 
-                                       :args args 
-                                       :row (:row curr-left) 
-                                       :col (:col curr-left)}
-                dispatch-node         (if has-at? (assoc base-node :static-type type-name) base-node)]
+                dispatch-node         (ast/->Dispatch curr-left
+                                                      type-name
+                                                      method-id
+                                                      args
+                                                      (:row curr-left)
+                                                      (:col curr-left))]
             (recur dispatch-node curr-toks))
           [curr-left curr-toks])))))
 
@@ -293,12 +242,7 @@
           (let [op tag
                 curr-toks (rest curr-toks)
                 [right curr-toks] (next-parser-fn curr-toks)]
-            (recur {:type :binary-op 
-                    :op op 
-                    :left curr-left 
-                    :right right 
-                    :row (:row curr-left) 
-                    :col (:col curr-left)} curr-toks))
+            (recur (ast/->BinaryOp op curr-left right (:row curr-left) (:col curr-left)) curr-toks))
           [curr-left curr-toks])))))
 
 (defn parse-unary [tokens expected-tag next-layer-fn current-layer-fn]
@@ -306,10 +250,7 @@
     (let [[row col] (peek-pos tokens)
           tokens        (skip tokens expected-tag)
           [expr tokens] (current-layer-fn tokens)]
-      [{:type expected-tag 
-        :expr expr 
-        :row row 
-        :col col} tokens])
+      [(ast/->UnaryOp expected-tag expr row col) tokens])
     (next-layer-fn tokens)))
 
 (defn parse-tilde [tokens]
@@ -331,12 +272,7 @@
       (let [op tag
             tokens (rest tokens)
             [right tokens] (parse-add-sub tokens)]
-        [{:type :binary-op 
-          :op op 
-          :left left 
-          :right right 
-          :row (:row left) 
-          :col (:col left)} tokens])
+        [(ast/->BinaryOp op left right (:row left) (:col left)) tokens])
       [left tokens])))
 
 (defn parse-not [tokens]
@@ -350,17 +286,12 @@
             [id tokens] (expect tokens :object-identifier)
             tokens (skip tokens :assign)
             [expr tokens] (parse-expr tokens)]
-        [{:type :assign 
-          :name id 
-          :expr expr 
-          :row row 
-          :col col} tokens])
+        [(ast/->Assign id expr row col) tokens])
       (parse-not tokens))))
 
 (defn parse-program [tokens]
   (let [[classes next-toks] (parse-semicolon-terminated tokens parse-class :eof)]
-    [{:type :program 
-      :classes classes} next-toks]))
+    [(ast/->Program classes) next-toks]))
 
 (defn lex-all
   [filename]
@@ -372,10 +303,8 @@
           (recur next-state (conj tokens token)))
         (conj tokens ["EOF" :eof -1 -1])))))
 
-(defn -main [& args]
-  (let [filename (first args)]
-    (if (nil? filename)
-      (println "usage: clj -M -m parser <file.cl>")
-      (let [tokens (lex-all filename)
-            [ast _] (parse-program tokens)]
-        (pprint/pprint ast)))))
+(defn get-ast
+  [filename]
+  (let [tokens  (lex-all filename)
+        [ast _] (parse-program tokens)]
+    ast))
