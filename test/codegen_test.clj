@@ -700,16 +700,16 @@
       (is (= 0 exit))
       (is (= "1 2 3 5 7 8 YN" stdout))))
 
-  (testing "Compilação e execução dos arquivos válidos existentes em tests/"
-    (let [{:keys [exit stdout]} (compile-file-and-run "tests/exprs.cl")]
+  (testing "Compilação e execução dos arquivos válidos existentes em test/fixtures/"
+    (let [{:keys [exit stdout]} (compile-file-and-run "test/fixtures/exprs.cl")]
       (is (= 0 exit))
       (is (= "Menor\n" stdout)))
-    (let [{:keys [exit stdout]} (compile-file-and-run "tests/stress_self_type.cl")]
+    (let [{:keys [exit stdout]} (compile-file-and-run "test/fixtures/stress_self_type.cl")]
       (is (= 0 exit))
       (is (= "ok\n" stdout)))
-    (let [{:keys [exit]} (compile-file-and-run "tests/stress_inheritance_case.cl")]
+    (let [{:keys [exit]} (compile-file-and-run "test/fixtures/stress_inheritance_case.cl")]
       (is (= 0 exit)))
-    (let [{:keys [exit]} (compile-file-and-run "tests/class-inherits.cl")]
+    (let [{:keys [exit]} (compile-file-and-run "test/fixtures/class-inherits.cl")]
       (is (= 0 exit)))))
 
 (deftest audit-corner-cases-test
